@@ -114,9 +114,14 @@ pub async fn agent_get_state(
             let info = rec.get("info")?.as_object()?;
             let session_id = info.get("id")?.as_str()?;
             let cwd = info.get("cwd")?.as_str()?;
-            let title = as_option_str(rec.get("title").or_else(|| rec.get("display_title")))
-                .or_else(|| cwd.split('/').last())
-                .unwrap_or("Untitled");
+            let title = {
+                let t = as_option_str(rec.get("title"))
+                    .or_else(|| as_option_str(rec.get("session_summary")))
+                    .or_else(|| as_option_str(rec.get("sessionSummary")))
+                    .unwrap_or("");
+                if !t.trim().is_empty() { t.trim().to_string() }
+                else { "New session".to_string() }
+            };
             let updated_at = as_option_str(rec.get("updated_at")
                 .or_else(|| rec.get("updatedAt"))
                 .or_else(|| rec.get("last_active_at")))
@@ -212,7 +217,7 @@ pub async fn agent_new_session(
     let bridge = guard.as_mut().ok_or_else(|| "agent not connected".to_string())?;
     bridge
         .call(
-            "new_session",
+            "session/new",
             json!({"cwd": workspace, "mcpServers": []}),
         )
         .await
@@ -240,7 +245,7 @@ pub async fn agent_load_session(
     let mut guard = state.agent.lock().await;
     let bridge = guard.as_mut().ok_or_else(|| "agent not connected".to_string())?;
     bridge
-        .call("load_session", json!({"sessionId": session_id, "cwd": cwd}))
+        .call("session/load", json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []}))
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -381,7 +386,7 @@ pub async fn agent_send_prompt(
         other => other,
     };
     bridge
-        .call("prompt", params)
+        .call("session/prompt", params)
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
