@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      CSP is set via src-tauri/tauri.conf.json (app.security.csp), which
+      Tauri 2 enforces at the WebView protocol layer in BOTH dev (http://tauri.localhost)
+      and production (tauri://) modes. The original Electron build had a
+      stricter meta-CSP here (`script-src 'self'`), but Vite dev mode injects
+      an inline HMR bootstrap script that this would block, so we delegate
+      CSP entirely to Tauri and keep this HTML minimal.
+    -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Grok Build Desktop</title>
+  </head>
+  <body>
+    <div id="root">
+      <!--
+        Fallback content visible while React mounts (or if it never does).
+        Replaced wholesale by React on first render. If you see this in
+        a built app, open devtools (Ctrl+Shift+I) and check the console.
+      -->
+      <div id="boot-fallback" style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif;color:#888;background:#1a1a1a">
+        <div style="text-align:center">
+          <div style="font-size:14px;letter-spacing:.2em;margin-bottom:8px">GROK BUILD DESKTOP</div>
+          <div style="font-size:12px">Booting…</div>
+        </div>
+      </div>
+    </div>
+    <script>
+      // Catch synchronous load failures (404 on main.tsx, etc.) so they
+      // surface in devtools instead of silently leaving the boot fallback.
+      window.addEventListener("error", (e) => {
+        const f = document.getElementById("boot-fallback");
+        if (f) f.innerHTML =
+          '<div style="text-align:center;color:#f88">' +
+          '<div style="font-size:12px;margin-bottom:8px">window.error</div>' +
+          '<pre style="font-size:11px;max-width:80vw;white-space:pre-wrap">' +
+          String(e.message || e.error || e) + '</pre></div>';
+      });
+      window.addEventListener("unhandledrejection", (e) => {
+        const f = document.getElementById("boot-fallback");
+        if (f) f.innerHTML =
+          '<div style="text-align:center;color:#f88">' +
+          '<div style="font-size:12px;margin-bottom:8px">unhandledrejection</div>' +
+          '<pre style="font-size:11px;max-width:80vw;white-space:pre-wrap">' +
+          String(e.reason) + '</pre></div>';
+      });
+    </script>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>

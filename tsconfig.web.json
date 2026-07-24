@@ -1,0 +1,37 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["vite/client"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.d.ts"],
+  "exclude": [
+    "src/App.tsx",
+    "src/SettingsView.tsx",
+    "src/ModelsView.tsx",
+    "src/ExtensionsView.tsx",
+    "src/WindowTitleBar.tsx",
+    "src/AskUserQuestionModal.tsx",
+    "src/PlanApprovalCard.tsx",
+    "src/PlanPanel.tsx",
+    "src/TrustPromptDialog.tsx",
+    "src/WaitingSessionsBanner.tsx",
+    "src/TerminalPanel.tsx",
+    "src/RewindModal.tsx",
+    "src/AgentSettingsView.tsx",
+    "src/AccountMenu.tsx",
+    "src/FilesTabSection.tsx",
+    "src/FileTree.tsx",
+    "src/FileViewer.tsx",
+    "src/TodoPanel.tsx",
+    "src/SubagentCard.tsx",
+    "src/WorkflowCard.tsx",
+    "src/BgTaskCard.tsx",
+    "src/DiffView.tsx",
+    "src/MarkdownBody.tsx",
+    "src/ProjectStatusBar.tsx",
+    "src/GoalDetailModal.tsx",
+    "src/GoalProgressBubble.tsx",
+    "src/PlanProgressBubble.tsx"
+  ]
+}
