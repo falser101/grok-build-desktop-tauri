@@ -138,7 +138,7 @@ fn detect_goal_action_verb(text: &str) -> Option<&'static str> {
 
 /// Push a `goal_action` card into the timeline. Mirrors Electron's
 /// `beginGoalAction`.
-async fn push_goal_action_card(state: &AppState, verb: &str) {
+async fn push_goal_action_card(state: &AppState, verb: &str, app: &tauri::AppHandle) {
     {
         let mut tl = state.timeline.lock().await;
         for item in tl.iter_mut() {
@@ -155,6 +155,9 @@ async fn push_goal_action_card(state: &AppState, verb: &str) {
     let mut tl = state.timeline.lock().await;
     tl.push(json!({"id":id,"kind":"goal_action","verb":verb,"status":"running"}));
     drop(tl);
+    // Push to renderer immediately so the user sees the running card.
+    let snap = build_snapshot_from_state(state).await;
+    emit_snapshot_event(app, snap).await;
 }
 
 fn detect_manual_compact(text: &str) -> Option<&str> {
@@ -166,7 +169,7 @@ fn detect_manual_compact(text: &str) -> Option<&str> {
     }
 }
 
-async fn push_compact_card(state: &AppState, mode: &str, percentage: Option<f64>) {
+async fn push_compact_card(state: &AppState, mode: &str, percentage: Option<f64>, app: &tauri::AppHandle) {
     use rand::Rng;
     let id = format!("compact-{:016x}", rand::thread_rng().gen::<u64>());
     *state.compacting.lock().await = true;
@@ -176,6 +179,9 @@ async fn push_compact_card(state: &AppState, mode: &str, percentage: Option<f64>
     let mut tl = state.timeline.lock().await;
     tl.push(item);
     drop(tl);
+    // Push to renderer immediately so the user sees the running card.
+    let snap = build_snapshot_from_state(state).await;
+    emit_snapshot_event(app, snap).await;
 }
 
 // ───────────────────────── session runtime cache ─────────────────────────
@@ -1139,7 +1145,7 @@ pub async fn handle_session_update(
         if replaying { return; }
         let percentage = as_f64_or(some_update, "percentage")
             .or_else(|| as_f64_or(some_update, "percent"));
-        push_compact_card(state, "auto", percentage).await;
+        push_compact_card(state, "auto", percentage, app).await;
         maybe_emit_snapshot(state, app).await;
         return;
     }
@@ -1784,6 +1790,7 @@ pub async fn agent_stop(state: State<'_, AppState>) -> Result<(), String> {
 pub async fn agent_send_prompt(
     payload: Value,
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
     sync_active_into_runtimes(&state).await;
 
@@ -1811,10 +1818,10 @@ pub async fn agent_send_prompt(
     let is_manual_compact = detect_manual_compact(&text).is_some();
     let goal_verb = detect_goal_action_verb(&text);
     if is_manual_compact {
-        push_compact_card(&state, "manual", None).await;
+        push_compact_card(&state, "manual", None, &app).await;
     }
     if let Some(verb) = goal_verb {
-        push_goal_action_card(&state, verb).await;
+        push_goal_action_card(&state, verb, &app).await;
     }
 
     let params = json!({
@@ -1831,10 +1838,10 @@ pub async fn agent_send_prompt(
     match result {
         Ok(_) => {
             if is_manual_compact {
-                finish_compact_card(&state, "completed", None, None, None).await;
+                finish_compact_card(&state, "completed", None, None, None, &app).await;
             }
             if goal_verb.is_some() {
-                finish_goal_action_card(&state, "completed", None).await;
+                finish_goal_action_card(&state, "completed", None, &app).await;
             }
             // Hydrate the session bag so the next switch is WARM.
             let sid = state.session_id.lock().await.clone();
@@ -1856,6 +1863,7 @@ pub async fn agent_send_prompt(
                     if cancelled { None } else { Some(&msg) },
                     None,
                     None,
+                    &app,
                 ).await;
             }
             if goal_verb.is_some() {
@@ -1863,6 +1871,7 @@ pub async fn agent_send_prompt(
                     &state,
                     if cancelled { "cancelled" } else { "failed" },
                     if cancelled { None } else { Some(&msg) },
+                    &app,
                 ).await;
             }
             Err(msg)
@@ -1877,6 +1886,7 @@ async fn finish_compact_card(
     message: Option<&str>,
     tokens_before: Option<f64>,
     tokens_after: Option<f64>,
+    app: &tauri::AppHandle,
 ) {
     *state.compacting.lock().await = false;
     let cid = state.compact_timeline_id.lock().await.clone();
@@ -1893,6 +1903,8 @@ async fn finish_compact_card(
         drop(tl);
     }
     *state.compact_timeline_id.lock().await = None;
+    let snap = build_snapshot_from_state(state).await;
+    emit_snapshot_event(app, snap).await;
 }
 
 /// Flip the running goal_action card to a terminal status.
@@ -1900,6 +1912,7 @@ async fn finish_goal_action_card(
     state: &AppState,
     status: &str,
     message: Option<&str>,
+    app: &tauri::AppHandle,
 ) {
     let gid = state.goal_action_timeline_id.lock().await.clone();
     if let Some(ref id) = gid {
@@ -1913,6 +1926,8 @@ async fn finish_goal_action_card(
         drop(tl);
     }
     *state.goal_action_timeline_id.lock().await = None;
+    let snap = build_snapshot_from_state(state).await;
+    emit_snapshot_event(app, snap).await;
 }
 
 #[tauri::command]
