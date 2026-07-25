@@ -28,6 +28,156 @@ async fn with_bridge<'a>(
     Ok(state.agent.lock().await)
 }
 
+// ───────────────────────── tool content extraction ───────────────────────
+
+/// Max chars of tool output before truncation (mirrors Electron's
+/// `MAX_TOOL_OUTPUT_CHARS`).
+const MAX_TOOL_OUTPUT_CHARS: usize = 80_000;
+
+/// Parse ACP `ToolCallContent[]` into diffs + concatenated text output.
+/// Wire shapes from the agent:
+///   { type: "diff", path, oldText?, newText }
+///   { type: "content", content: { type: "text", text } }
+///   { type: "text", text }
+fn parse_tool_content(raw: Option<&Vec<Value>>) -> (Vec<Value>, Option<String>, bool) {
+    let Some(arr) = raw else {
+        return (vec![], None, false);
+    };
+    let mut diffs: Vec<Value> = Vec::new();
+    let mut text_parts: Vec<String> = Vec::new();
+
+    for item in arr {
+        let rec = item.as_object();
+        let Some(rec) = rec else { continue };
+        let typ = rec.get("type").and_then(|v| v.as_str());
+
+        if typ == Some("diff") {
+            let path = rec.get("path")
+                .or_else(|| rec.get("filePath"))
+                .or_else(|| rec.get("file_path"))
+                .and_then(|v| v.as_str());
+            let new_text = rec.get("newText")
+                .or_else(|| rec.get("new_text"))
+                .or_else(|| rec.get("new"))
+                .and_then(|v| v.as_str());
+            if path.is_none() || new_text.is_none() { continue; }
+            let mut diff_obj = serde_json::Map::new();
+            diff_obj.insert("path".into(), Value::String(path.unwrap().to_string()));
+            diff_obj.insert("newText".into(), Value::String(new_text.unwrap().to_string()));
+            if let Some(ot) = rec.get("oldText")
+                .or_else(|| rec.get("old_text"))
+                .or_else(|| rec.get("old"))
+                .and_then(|v| v.as_str())
+            {
+                diff_obj.insert("oldText".into(), Value::String(ot.to_string()));
+            }
+            diffs.push(Value::Object(diff_obj));
+            continue;
+        }
+
+        if typ == Some("content") || typ == Some("text") {
+            let nested = rec.get("content").and_then(|v| v.as_object());
+            let text = nested.and_then(|n| n.get("text")).and_then(|v| v.as_str())
+                .or_else(|| rec.get("text").and_then(|v| v.as_str()));
+            if let Some(t) = text {
+                text_parts.push(t.to_string());
+            }
+            continue;
+        }
+
+        // Bare `{ text: "…" }` without a type field.
+        if typ.is_none() {
+            if let Some(t) = rec.get("text").and_then(|v| v.as_str()) {
+                text_parts.push(t.to_string());
+            }
+        }
+    }
+
+    let mut output_text = if text_parts.is_empty() { None } else { Some(text_parts.join("\n")) };
+    let mut truncated = false;
+    if let Some(ref t) = output_text {
+        if t.len() > MAX_TOOL_OUTPUT_CHARS {
+            output_text = Some(format!("{}\n… [truncated]", &t[..MAX_TOOL_OUTPUT_CHARS]));
+            truncated = true;
+        }
+    }
+    (diffs, output_text, truncated)
+}
+
+/// Extract a `toolKind` tag from the update payload (read / write / search /
+/// bash / …) so the renderer can pick an icon. Mirrors Electron's
+/// `semanticToolKind()`.
+fn semantic_tool_kind(update: &serde_json::Map<String, Value>) -> Option<String> {
+    update.get("toolKind")
+        .or_else(|| update.get("tool_kind"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            let title = update.get("title").or_else(|| update.get("name")).and_then(|v| v.as_str())?;
+            let t = title.to_lowercase();
+            if t.contains("read") { Some("read".into()) }
+            else if t.contains("write") { Some("write".into()) }
+            else if t.contains("search") || t.contains("grep") { Some("search".into()) }
+            else if t.contains("bash") || t.contains("shell") || t.contains("run") { Some("bash".into()) }
+            else if t.contains("list") || t.contains("ls") { Some("list_dir".into()) }
+            else if t.contains("edit") || t.contains("replace") { Some("edit".into()) }
+            else { None }
+        })
+}
+
+/// Detect `/goal (pause|resume|clear)` at the start of a prompt text.
+fn detect_goal_action_verb(text: &str) -> Option<&'static str> {
+    let trimmed = text.trim();
+    if trimmed.len() < 6 { return None; }
+    let lower = trimmed.to_lowercase();
+    if lower == "/goal pause" { return Some("pause"); }
+    if lower == "/goal resume" { return Some("resume"); }
+    if lower == "/goal clear" { return Some("clear"); }
+    None
+}
+
+/// Push a `goal_action` card into the timeline. Mirrors Electron's
+/// `beginGoalAction`.
+async fn push_goal_action_card(state: &AppState, verb: &str) {
+    {
+        let mut tl = state.timeline.lock().await;
+        for item in tl.iter_mut() {
+            if item.get("kind") == Some(&json!("goal_action"))
+                && item.get("status") == Some(&json!("running"))
+            {
+                item["status"] = json!("cancelled");
+            }
+        }
+    }
+    use rand::Rng;
+    let id = format!("goalact-{:016x}", rand::thread_rng().gen::<u64>());
+    *state.goal_action_timeline_id.lock().await = Some(id.clone());
+    let mut tl = state.timeline.lock().await;
+    tl.push(json!({"id":id,"kind":"goal_action","verb":verb,"status":"running"}));
+    drop(tl);
+}
+
+fn detect_manual_compact(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    if trimmed.starts_with("/compact ") || trimmed == "/compact" {
+        Some("manual")
+    } else {
+        None
+    }
+}
+
+async fn push_compact_card(state: &AppState, mode: &str, percentage: Option<f64>) {
+    use rand::Rng;
+    let id = format!("compact-{:016x}", rand::thread_rng().gen::<u64>());
+    *state.compacting.lock().await = true;
+    *state.compact_timeline_id.lock().await = Some(id.clone());
+    let mut item = json!({"id":id,"kind":"compact","status":"running","mode":mode});
+    if let Some(p) = percentage { item["percentage"] = json!(p); }
+    let mut tl = state.timeline.lock().await;
+    tl.push(item);
+    drop(tl);
+}
+
 // ───────────────────────── session runtime cache ─────────────────────────
 //
 // These helpers mirror the per-session `runtimes` map and the
@@ -85,6 +235,8 @@ async fn sync_active_into_runtimes(state: &AppState) {
             session_mode: "default".to_string(),
             todos: Vec::new(),
             plan_content: None,
+            goal_state: None,
+            goal_todos: Vec::new(),
             available_models,
             hydrated: prev_hydrated,
         },
@@ -619,6 +771,21 @@ pub async fn build_snapshot_from_state(state: &AppState) -> Value {
         map.insert("replaying".into(), json!(replaying));
         map.insert("sessionMode".into(), json!(session_mode));
         map.insert("todos".into(), Value::Array(todos));
+        // Goal subsystem — populated from the focused session's runtime
+        // bag (per-session, survives session switches like Electron).
+        {
+            let cache = state.runtime_cache.lock().await;
+            if let Some(sid) = &sess_id {
+                if let Some(rt) = cache.get(sid) {
+                    if let Some(ref gs) = rt.goal_state {
+                        map.insert("goalState".into(), gs.clone());
+                    }
+                    if !rt.goal_todos.is_empty() {
+                        map.insert("goalTodos".into(), Value::Array(rt.goal_todos.clone()));
+                    }
+                }
+            }
+        }
         if let Some(ref ws) = workspace {
             map.insert("workspace".into(), json!(ws));
             map.insert("statusBarCwd".into(), json!(ws));
@@ -827,13 +994,49 @@ pub async fn handle_session_update(
         return;
     }
 
-    // tool_call – agent invoked a tool. Phase 2 fills the full ToolCard.
+    // tool_call – agent invoked a tool. Push a new card, or update
+    // the existing one if we've already seen this toolCallId (dedup
+    // for session replay or duplicate stream emits).
     if kind == "tool_call" {
         let tool_call_id = as_str_or(some_update, "toolCallId").unwrap_or_else(|| new_id("tool"));
         let title = as_str_or(some_update, "title").unwrap_or_else(|| "tool".to_string());
         let status = as_str_or(some_update, "status").unwrap_or_else(|| "pending".to_string());
-        let tool_kind = as_str_or(some_update, "toolKind");
+        let tool_kind = semantic_tool_kind(some_update);
+        let content_raw = some_update.get("content").and_then(|v| v.as_array());
+        let (diffs, output_text, output_truncated) = parse_tool_content(content_raw);
+        let has_content = diffs.len() > 0 || output_text.is_some();
+
+        // Dedup: if tool_index already tracks this toolCallId, update
+        // the existing card (mirrors Electron backend.ts:5390-5410).
+        {
+            let ti = state.tool_index.lock().await;
+            if let Some(existing_id) = ti.get(&tool_call_id) {
+                let mut tl = state.timeline.lock().await;
+                if let Some(item) = tl.iter_mut().find(|i| i.get("id").and_then(|v| v.as_str()) == Some(existing_id)) {
+                    if item.get("kind") == Some(&json!("tool")) {
+                        item["title"] = json!(title);
+                        item["status"] = json!(status);
+                        if let Some(ref tk) = tool_kind { item["toolKind"] = json!(tk); }
+                        if has_content {
+                            if !diffs.is_empty() { item["diffs"] = Value::Array(diffs); }
+                            if let Some(ref ot) = output_text { item["outputText"] = json!(ot); }
+                            if output_truncated { item["outputTruncated"] = json!(true); }
+                        }
+                    }
+                }
+                drop(ti);
+                drop(tl);
+                maybe_emit_snapshot(state, app).await;
+                return;
+            }
+        }
+
         let id = new_id("tool");
+        {
+            let mut ti = state.tool_index.lock().await;
+            ti.insert(tool_call_id.clone(), id.clone());
+            drop(ti);
+        }
         let mut item = json!({
             "id": id,
             "kind": "tool",
@@ -841,8 +1044,11 @@ pub async fn handle_session_update(
             "title": title,
             "status": status,
         });
-        if let Some(ref tk) = tool_kind {
-            item["toolKind"] = json!(tk);
+        if let Some(ref tk) = tool_kind { item["toolKind"] = json!(tk); }
+        if has_content {
+            if !diffs.is_empty() { item["diffs"] = Value::Array(diffs); }
+            if let Some(ref ot) = output_text { item["outputText"] = json!(ot); }
+            if output_truncated { item["outputTruncated"] = json!(true); }
         }
         let mut tl = state.timeline.lock().await;
         tl.push(item);
@@ -852,23 +1058,61 @@ pub async fn handle_session_update(
     }
 
     // tool_call_update – follow-up to a tool_call (output text, diffs).
-    // Phase 2 fills diff extraction and outputText merge.
     if kind == "tool_call_update" {
         let tool_call_id = as_str_or(some_update, "toolCallId");
-        if let Some(tcid) = tool_call_id {
+        let status = as_str_or(some_update, "status");
+        let title = as_str_or(some_update, "title");
+        let tool_kind = semantic_tool_kind(some_update);
+        let content_raw = some_update.get("content").and_then(|v| v.as_array());
+        let (diffs, output_text, output_truncated) = parse_tool_content(content_raw);
+        let has_content = diffs.len() > 0 || output_text.is_some();
+
+        if let Some(tcid) = &tool_call_id {
             let mut tl = state.timeline.lock().await;
-            // Find the matching tool card and update its status + output.
-            if let Some(item) = tl.iter_mut().find(|i| {
-                i.get("toolCallId").and_then(|v| v.as_str()) == Some(&tcid)
-            }) {
-                if item.get("kind") == Some(&json!("tool")) {
-                    if let Some(s) = as_str_or(some_update, "status") {
-                        item["status"] = json!(s);
-                    }
-                    if let Some(t) = as_str_or(some_update, "title") {
-                        item["title"] = json!(t);
-                    }
+            // First: try the tool_index (fast path).
+            let indexed_id = {
+                let ti = state.tool_index.lock().await;
+                ti.get(tcid).cloned()
+            };
+            let found = if let Some(ref iid) = indexed_id {
+                tl.iter_mut().find(|i| i.get("id").and_then(|v| v.as_str()) == Some(iid.as_str()))
+            } else {
+                tl.iter_mut().find(|i|
+                    i.get("kind") == Some(&json!("tool")) &&
+                    i.get("toolCallId").and_then(|v| v.as_str()) == Some(tcid.as_str())
+                )
+            };
+            if let Some(item) = found {
+                if let Some(ref s) = status { item["status"] = json!(s); }
+                if let Some(ref t) = title { item["title"] = json!(t); }
+                if let Some(ref tk) = tool_kind { item["toolKind"] = json!(tk); }
+                if has_content {
+                    if !diffs.is_empty() { item["diffs"] = Value::Array(diffs); }
+                    if let Some(ref ot) = output_text { item["outputText"] = json!(ot); }
+                    if output_truncated { item["outputTruncated"] = json!(true); }
                 }
+            } else {
+                // Late tool card without a prior tool_call — create one.
+                let id = new_id("tool");
+                {
+                    let mut ti = state.tool_index.lock().await;
+                    ti.insert(tcid.clone(), id.clone());
+                    drop(ti);
+                }
+                let mut item = json!({
+                    "id": id,
+                    "kind": "tool",
+                    "toolCallId": tcid,
+                    "title": title.unwrap_or_else(|| tcid.clone()),
+                    "status": status.unwrap_or_else(|| "in_progress".to_string()),
+                });
+                if let Some(ref tk) = tool_kind { item["toolKind"] = json!(tk); }
+                if has_content {
+                    if !diffs.is_empty() { item["diffs"] = Value::Array(diffs); }
+                    if let Some(ref ot) = output_text { item["outputText"] = json!(ot); }
+                    if output_truncated { item["outputTruncated"] = json!(true); }
+                }
+                tl.push(item);
             }
             drop(tl);
         }
@@ -893,16 +1137,9 @@ pub async fn handle_session_update(
     if kind == "auto_compact_started" {
         let replaying = *state.replaying.lock().await;
         if replaying { return; }
-        let id = new_id("compact");
         let percentage = as_f64_or(some_update, "percentage")
             .or_else(|| as_f64_or(some_update, "percent"));
-        let mut item = json!({
-            "id": id, "kind": "compact", "status": "running", "mode": "auto",
-        });
-        if let Some(p) = percentage { item["percentage"] = json!(p); }
-        let mut tl = state.timeline.lock().await;
-        tl.push(item);
-        drop(tl);
+        push_compact_card(state, "auto", percentage).await;
         maybe_emit_snapshot(state, app).await;
         return;
     }
@@ -1032,10 +1269,59 @@ pub async fn handle_session_update(
         return;
     }
 
-    // goal_updated – goal orchestrator progress. Phase 3 wires full goalState.
+    // goal_updated – goal orchestrator progress. Drives the 🎯 bubble.
     if kind == "goal_updated" || kind == "GoalUpdated" {
-        tracing::debug!("goal_updated received — Phase 3 will wire goalState/goalTodos");
-        // Forward to snapshot immediately so the renderer picks up raw fields.
+        let sid = state.session_id.lock().await.clone();
+        if let Some(ref session_id) = sid {
+            let goal_id = as_str_or(some_update, "goal_id")
+                .or_else(|| as_str_or(some_update, "goalId"));
+            let objective = as_str_or(some_update, "objective").unwrap_or_default();
+            let status = as_str_or(some_update, "status").unwrap_or_else(|| "active".to_string());
+            let phase = as_str_or(some_update, "phase").unwrap_or_else(|| "idle".to_string());
+            let token_budget = as_f64_or(some_update, "token_budget").or_else(|| as_f64_or(some_update, "tokenBudget"));
+            let tokens_used = as_f64_or(some_update, "tokens_used").or_else(|| as_f64_or(some_update, "tokensUsed"));
+            let elapsed_ms = as_f64_or(some_update, "elapsed_ms").or_else(|| as_f64_or(some_update, "elapsedMs"));
+            let pause_message = as_str_or(some_update, "pause_message")
+                .or_else(|| as_str_or(some_update, "pauseMessage"));
+            let last_event = as_str_or(some_update, "last_event")
+                .or_else(|| as_str_or(some_update, "lastEvent"));
+            let last_event_detail = as_str_or(some_update, "last_event_detail")
+                .or_else(|| as_str_or(some_update, "lastEventDetail"));
+            let updated_at = as_f64_or(some_update, "updated_at")
+                .or_else(|| as_f64_or(some_update, "updatedAt"));
+            let verifying = some_update.get("verifyingCompletion").and_then(|v| v.as_bool()).unwrap_or(false);
+            let planning = some_update.get("planning").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            let mut goal = json!({
+                "goalId": goal_id.unwrap_or_default(),
+                "objective": objective,
+                "status": status,
+                "phase": phase,
+                "verifyingCompletion": verifying,
+                "planning": planning,
+            });
+            if let Some(tb) = token_budget { goal["tokenBudget"] = json!(tb); }
+            if let Some(tu) = tokens_used { goal["tokensUsed"] = json!(tu); }
+            if let Some(em) = elapsed_ms { goal["elapsedMs"] = json!(em); }
+            if let Some(pm) = pause_message { goal["pauseMessage"] = json!(pm); }
+            if let Some(le) = last_event { goal["lastEvent"] = json!(le); }
+            if let Some(led) = last_event_detail { goal["lastEventDetail"] = json!(led); }
+            if let Some(ua) = updated_at { goal["updatedAt"] = json!(ua); }
+
+            let goal_todos: Vec<Value> = some_update
+                .get("goalTodos")
+                .or_else(|| some_update.get("goal_todos"))
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.clone())
+                .unwrap_or_default();
+
+            let mut cache = state.runtime_cache.lock().await;
+            if let Some(rt) = cache.get_mut(session_id) {
+                rt.goal_state = Some(goal);
+                rt.goal_todos = goal_todos;
+            }
+            drop(cache);
+        }
         maybe_emit_snapshot(state, app).await;
         return;
     }
@@ -1109,8 +1395,22 @@ pub async fn handle_session_update(
         return;
     }
 
-    // finalize / done / completed / idle – turn complete; turn off replaying.
+    // finalize / done / completed / idle – turn complete; turn off
+    // replaying and set streaming=false on open assistant/thought items.
     if kind == "finalize" || kind == "done" || kind == "completed" || kind == "idle" {
+        {
+            let mut tl = state.timeline.lock().await;
+            for item in tl.iter_mut() {
+                let k = item.get("kind").and_then(|v| v.as_str());
+                if k == Some("assistant") || k == Some("thought") {
+                    item["streaming"] = json!(false);
+                }
+            }
+            // Also clear turn-scoped todos on turn completion.
+        }
+        {
+            state.todos.lock().await.clear();
+        }
         let mut re = state.replaying.lock().await;
         *re = false;
         drop(re);
@@ -1485,26 +1785,10 @@ pub async fn agent_send_prompt(
     payload: Value,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    // Mirror the focused session before issuing the prompt so the
-    // bag captures any user-typed text that's been streamed into
-    // focus by `handle_session_update`. After we unlock the
-    // connection for the bridge call, focus is still safe — the
-    // reader task uses `session_id` to filter.
     sync_active_into_runtimes(&state).await;
 
     let mut guard = state.agent.lock().await;
     let bridge = guard.as_mut().ok_or_else(|| "agent not connected".to_string())?;
-    // Translate the renderer's payload shape into the ACP
-    // `session/prompt` schema the agent expects:
-    //   { sessionId: string, prompt: ContentBlock[] }
-    // The renderer sends a render-flavored payload
-    //   { text, attachments, hideUserMessage, prependGoal, prependLoop }
-    // which is *not* valid ACP — passing it through yields
-    // "json-rpc error (-32602): Invalid params". The agent only
-    // inspects `sessionId` and `prompt` for /compact, /rewind, and
-    // regular text turns; UI flags are not forwarded. Attachments
-    // (if any) are dropped here — wire them through once the
-    // renderer's attachment model moves off opaque ids.
     let session_id = state
         .session_id
         .lock()
@@ -1520,6 +1804,16 @@ pub async fn agent_send_prompt(
             .unwrap_or_default(),
         _ => String::new(),
     };
+
+    // /goal (pause|resume|clear) → push a goal_action receipt card.
+    if let Some(verb) = detect_goal_action_verb(&text) {
+        push_goal_action_card(&state, verb).await;
+    }
+    // /compact manual → push a compact card.
+    if let Some(manual) = detect_manual_compact(&text) {
+        push_compact_card(&state, "manual", None).await;
+    }
+
     let params = json!({
         "sessionId": session_id,
         "prompt": [

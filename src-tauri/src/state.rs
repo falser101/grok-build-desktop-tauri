@@ -48,6 +48,15 @@ pub struct SessionRuntime {
     pub todos: Vec<Value>,
     /// Plan body restored from disk (mirrors the Electron `planContent`).
     pub plan_content: Option<String>,
+    /// Goal-mode state from the shell's `goal_updated` notification.
+    /// `None` while no goal is active. When set, drives the 🎯 bubble
+    /// and the goal detail modal. Persisted across session switches
+    /// like the Electron `SessionRuntime.goalState`.
+    pub goal_state: Option<Value>,
+    /// Goal-scoped todo items (separate from turn-scoped `todos`).
+    /// Survives busy→idle turn boundaries so the goal detail modal's
+    /// progress list stays populated across turns.
+    pub goal_todos: Vec<Value>,
     /// Model catalog scoped to this session. Populated from the
     /// `models.availableModels` array returned by `session/load` (and
     /// refreshed by `x.ai/models/update` notifications). The renderer
@@ -75,6 +84,8 @@ pub fn empty_runtime(session_id: &str, cwd: &str) -> SessionRuntime {
         session_mode: "default".to_string(),
         todos: Vec::new(),
         plan_content: None,
+        goal_state: None,
+        goal_todos: Vec::new(),
         available_models: Vec::new(),
         hydrated: false,
     }
@@ -120,6 +131,33 @@ pub struct AppState {
     /// Cleared at turn boundaries. The goal-scoped `goalTodos` lives
     /// on the `SessionRuntime` bag (Phase 3 will wire it).
     pub todos: Mutex<Vec<Value>>,
+    /// ToolCallId → timeline item id index. Deduplicates tool cards
+    /// so a late `tool_call_update` can find and extend the card
+    /// created by the earlier `tool_call` event.
+    pub tool_index: Mutex<HashMap<String, String>>,
+    /// Most recent activity classification for the focused session.
+    /// One of "idle" / "working" / "loading" / "needsInput" /
+    /// terminal stains. Drives the Send/Stop button visibility.
+    pub activity: Mutex<String>,
+    /// Tokens used in the current turn / session (from agent meta).
+    pub tokens_used: Mutex<Option<f64>>,
+    /// True while this session is actively compacting.
+    pub compacting: Mutex<bool>,
+    /// Timeline id of the in-flight compact card, if any.
+    pub compact_timeline_id: Mutex<Option<String>>,
+    /// Timeline id of the in-flight goal_action card, if any.
+    /// Mirrors Electron's `goalActionTimelineId`.
+    pub goal_action_timeline_id: Mutex<Option<String>>,
+    /// Permission prompt queue (not yet approved/denied).
+    pub permission_queue: Mutex<Vec<Value>>,
+    /// Plan approval queue (exit_plan_mode responses pending).
+    pub plan_approval_queue: Mutex<Vec<Value>>,
+    /// x.ai/ask_user_question questionnaire queue.
+    pub question_queue: Mutex<Vec<Value>>,
+    /// Folder-trust prompts.
+    pub trust_prompt_queue: Mutex<Vec<Value>>,
+    /// Slash command /loop active flag (mirrors Electron's `loopActive`).
+    pub loop_active: Mutex<bool>,
     /// Last fetched billing / subscription usage (`UsageInfo` JSON
     /// shape). Cached so failed refreshes can keep showing the prior
     /// data with an `error` field, mirroring Electron's
