@@ -1805,13 +1805,16 @@ pub async fn agent_send_prompt(
         _ => String::new(),
     };
 
-    // /goal (pause|resume|clear) → push a goal_action receipt card.
-    if let Some(verb) = detect_goal_action_verb(&text) {
-        push_goal_action_card(&state, verb).await;
-    }
-    // /compact manual → push a compact card.
-    if let Some(manual) = detect_manual_compact(&text) {
+    // Card lifecycle: push before RPC, close on success/failure/cancel.
+    // Mirrors Electron's beginCompact → finishCompact + beginGoalAction →
+    // finishGoalAction pattern in sendPrompt (backend.ts:6730-6860).
+    let is_manual_compact = detect_manual_compact(&text).is_some();
+    let goal_verb = detect_goal_action_verb(&text);
+    if is_manual_compact {
         push_compact_card(&state, "manual", None).await;
+    }
+    if let Some(verb) = goal_verb {
+        push_goal_action_card(&state, verb).await;
     }
 
     let params = json!({
@@ -1820,26 +1823,96 @@ pub async fn agent_send_prompt(
             { "type": "text", "text": text }
         ],
     });
-    bridge
-        .call("session/prompt", params)
-        .await
-        .map_err(|e| e.to_string())?;
 
-    // A prompt submission implies the focused session is hydrated
-    // even if the user landed on it via direct URL — flip the flag
-    // so the next switch is a WARM hit.
-    let sid = state.session_id.lock().await.clone();
-    if let Some(sid) = sid {
-        // Best-effort hydrate: ensure a bag exists.
-        {
-            let mut cache = state.runtime_cache.lock().await;
-            cache
-                .entry(sid.clone())
-                .or_insert_with(|| empty_runtime(&sid, ""));
+    let result = bridge
+        .call("session/prompt", params)
+        .await;
+
+    match result {
+        Ok(_) => {
+            if is_manual_compact {
+                finish_compact_card(&state, "completed", None, None, None).await;
+            }
+            if goal_verb.is_some() {
+                finish_goal_action_card(&state, "completed", None).await;
+            }
+            // Hydrate the session bag so the next switch is WARM.
+            let sid = state.session_id.lock().await.clone();
+            if let Some(sid) = sid {
+                let mut cache = state.runtime_cache.lock().await;
+                cache.entry(sid.clone()).or_insert_with(|| empty_runtime(&sid, ""));
+                drop(cache);
+                mark_hydrated(&state, &sid, true).await;
+            }
+            Ok(())
         }
-        mark_hydrated(&state, &sid, true).await;
+        Err(e) => {
+            let msg = e.to_string();
+            let cancelled = msg.to_lowercase().contains("cancel");
+            if is_manual_compact {
+                finish_compact_card(
+                    &state,
+                    if cancelled { "cancelled" } else { "failed" },
+                    if cancelled { None } else { Some(&msg) },
+                    None,
+                    None,
+                ).await;
+            }
+            if goal_verb.is_some() {
+                finish_goal_action_card(
+                    &state,
+                    if cancelled { "cancelled" } else { "failed" },
+                    if cancelled { None } else { Some(&msg) },
+                ).await;
+            }
+            Err(msg)
+        }
     }
-    Ok(())
+}
+
+/// Flip the running compact card to a terminal status.
+async fn finish_compact_card(
+    state: &AppState,
+    status: &str,
+    message: Option<&str>,
+    tokens_before: Option<f64>,
+    tokens_after: Option<f64>,
+) {
+    *state.compacting.lock().await = false;
+    let cid = state.compact_timeline_id.lock().await.clone();
+    if let Some(ref id) = cid {
+        let mut tl = state.timeline.lock().await;
+        if let Some(item) = tl.iter_mut().find(|i| i.get("id").and_then(|v| v.as_str()) == Some(id.as_str())) {
+            if item.get("kind") == Some(&json!("compact")) {
+                item["status"] = json!(status);
+                if let Some(m) = message { item["message"] = json!(m); }
+                if let Some(b) = tokens_before { item["tokensBefore"] = json!(b); }
+                if let Some(a) = tokens_after { item["tokensAfter"] = json!(a); }
+            }
+        }
+        drop(tl);
+    }
+    *state.compact_timeline_id.lock().await = None;
+}
+
+/// Flip the running goal_action card to a terminal status.
+async fn finish_goal_action_card(
+    state: &AppState,
+    status: &str,
+    message: Option<&str>,
+) {
+    let gid = state.goal_action_timeline_id.lock().await.clone();
+    if let Some(ref id) = gid {
+        let mut tl = state.timeline.lock().await;
+        if let Some(item) = tl.iter_mut().find(|i| i.get("id").and_then(|v| v.as_str()) == Some(id.as_str())) {
+            if item.get("kind") == Some(&json!("goal_action")) {
+                item["status"] = json!(status);
+                if let Some(m) = message { item["message"] = json!(m); }
+            }
+        }
+        drop(tl);
+    }
+    *state.goal_action_timeline_id.lock().await = None;
 }
 
 #[tauri::command]
