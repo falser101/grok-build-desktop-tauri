@@ -25,7 +25,7 @@ use anyhow::{anyhow, Context, Result};
 use futures::{SinkExt, StreamExt};
 use rand::Rng;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
@@ -356,16 +356,50 @@ async fn run_reader(
         if let Some(method) = v.get("method").and_then(|x| x.as_str()) {
             let params = v.get("params").cloned().unwrap_or(Value::Null);
             tracing::debug!(method, "forwarding agent notification");
-            // The original Electron main routes `account:*` events on a
-            // separate channel; we use the same "account:event" name so
-            // SettingsView.tsx's `onAccountEvent` subscription still fires.
-            let event = if method.starts_with("account/") || method.contains("account") {
-                "account:event"
-            } else {
-                "agent:event"
-            };
+
+            // Account events go to a separate channel (SettingsView).
+            if method.starts_with("account/") || method.contains("account") {
+                let payload = json!({"method": method, "params": params});
+                if let Err(e) = app.emit("account:event", payload) {
+                    tracing::warn!(error = %e, "failed to emit account event");
+                }
+                // Re-emit a snapshot too — login_completed etc. flip
+                // `accountAvailable` for the composer chip, and the
+                // renderer relies on the snapshot for that field
+                // (snap.accountAvailable), not the separate
+                // account:event channel.
+                let state = app.state::<crate::state::AppState>();
+                let snap = crate::commands::build_snapshot_from_state(&state).await;
+                crate::commands::emit_snapshot_event(&app, snap).await;
+                continue;
+            }
+
+            // sessionUpdate / session/update: process to build timeline and emit snapshot.
+            if method == "sessionUpdate"
+                || method == "session/update"
+                || method == "_x.ai/session/update"
+                || method == "_x.ai/session_notification"
+            {
+                let state = app.state::<crate::state::AppState>();
+                crate::commands::handle_session_update(&params, &app, &state).await;
+                continue;
+            }
+
+            // models/update: hot-reload the model catalog (mirrors
+            // Electron's handler at backend.ts:5007). Without this,
+            // a custom provider added via Models settings never
+            // appears in the composer chip until the agent restarts.
+            if method == "_x.ai/models/update" || method == "x.ai/models/update" {
+                let state = app.state::<crate::state::AppState>();
+                crate::commands::handle_models_update(&state, &params).await;
+                let snap = crate::commands::build_snapshot_from_state(&state).await;
+                crate::commands::emit_snapshot_event(&app, snap).await;
+                continue;
+            }
+
+            // Other notifications: forward raw (renderer may log or ignore).
             let payload = json!({"method": method, "params": params});
-            if let Err(e) = app.emit(event, payload) {
+            if let Err(e) = app.emit("agent:event", payload) {
                 tracing::warn!(error = %e, "failed to emit agent event");
             }
             continue;

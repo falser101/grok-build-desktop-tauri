@@ -7,10 +7,15 @@
 pub mod agent;
 pub mod binary;
 pub mod commands;
+pub mod config_toml_sync;
 pub mod grok_cli;
+pub mod models_fetch;
 pub mod paths;
+pub mod presets;
 pub mod state;
 pub mod stubs;
+#[cfg(test)]
+pub mod test_helpers;
 pub mod window_cmds;
 
 use state::AppState;

@@ -356,6 +356,20 @@ function usageClass(pct: number): string {
   return "usage-low";
 }
 
+/** Short human label for the API protocol the provider uses. */
+function backendLabel(apiBackend: ApiBackend): string {
+  switch (apiBackend) {
+    case "chat_completions":
+      return "OpenAI";
+    case "messages":
+      return "Anthropic";
+    case "responses":
+      return "OpenAI Responses";
+    default:
+      return apiBackend;
+  }
+}
+
 type EditorState = {
   id?: string;
   presetId?: string;
@@ -400,6 +414,15 @@ function fromProvider(
       baseUrl = preset.baseUrl;
     }
   }
+  // Presets that don't explicitly opt into `x-api-key` (DeepSeek rejects
+  // the x-api-key header and is Bearer-only) must override whatever is on
+  // disk — otherwise a provider saved once with x-api-key would stay stuck
+  // because the editor initialises from the persisted config and the
+  // picker hides the offending option.
+  const presetForcesBearer = preset?.authStyle !== "x-api-key";
+  const authStyle =
+    presetForcesBearer ? "bearer" : p.authStyle ?? "bearer";
+
   return {
     id: p.id,
     presetId: p.presetId,
@@ -409,7 +432,7 @@ function fromProvider(
     apiKey: p.apiKey ?? "",
     envKey: p.envKey ?? "",
     enabled: p.enabled,
-    authStyle: p.authStyle ?? "bearer",
+    authStyle,
     models: p.models.map((m) => ({ ...m })),
     fetched: [],
   };
@@ -1222,7 +1245,13 @@ export function ModelsView({
                     }
                   >
                     <option value="bearer">Bearer</option>
-                    <option value="x-api-key">x-api-key</option>
+                    {/* Only render x-api-key when the preset explicitly
+                        opts in (`authStyle: "x-api-key"`). Presets that
+                        leave `authStyle` unset (e.g. DeepSeek, which
+                        rejects the x-api-key header) are Bearer-only. */}
+                    {editorPreset?.authStyle === "x-api-key" ? (
+                      <option value="x-api-key">x-api-key</option>
+                    ) : null}
                   </select>
                 </label>
               </div>
@@ -1502,7 +1531,7 @@ export function ModelsView({
                               {regionLabel}
                             </span>
                             <span className="models-provider-api">
-                              {p.apiBackend}
+                              {backendLabel(p.apiBackend)}
                             </span>
                             {!p.enabled ? (
                               <span className="ext-badge danger-pill">

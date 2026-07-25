@@ -28,3 +28,30 @@ pub fn managed_grok() -> PathBuf {
 pub fn managed_agent() -> PathBuf {
     grok_home().join("bin").join(if cfg!(windows) { "agent.exe" } else { "agent" })
 }
+
+/// Encode a workspace CWD the same way the CLI does (URL-encoded
+/// for the directory name). Mirrors `encodeURIComponent` JS.
+pub fn encode_session_cwd(cwd: &str) -> String {
+    // Per-segment percent encoding; matches what the agent writes.
+    let mut out = String::with_capacity(cwd.len());
+    for b in cwd.as_bytes() {
+        match *b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char);
+            }
+            _ => {
+                out.push_str(&format!("%{:02X}", b));
+            }
+        }
+    }
+    out
+}
+
+/// Plan file path for a session: `$HOME/.grok/sessions/<url-cwd>/<sid>/plan.md`.
+pub fn plan_file_path(cwd: &str, session_id: &str) -> PathBuf {
+    grok_home()
+        .join("sessions")
+        .join(encode_session_cwd(cwd))
+        .join(session_id)
+        .join("plan.md")
+}

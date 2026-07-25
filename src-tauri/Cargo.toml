@@ -25,6 +25,9 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
 
+# HTTP for provider usage queries (MiniMax / DeepSeek).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
 # Random / hex / process utilities
 rand = "0.8"
 which = "7"

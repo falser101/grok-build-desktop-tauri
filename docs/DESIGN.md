@@ -150,8 +150,8 @@ ACP methods we use today:
 | `respondAskUserQuestion` | `x.ai/ask_user_question/respond` |
 | `respondTrustPrompt` | `x.ai/folder_trust/respond` |
 | `respondPlanApproval` | `x.ai/exit_plan_mode/respond` |
-| `setModel` | `set_session_model` |
-| `setMode` | `set_session_mode` |
+| `setModel` | `session/set_model` (with `sessionId` + `_meta.reasoning_effort`) |
+| `setMode` | `session/set_mode` (with `sessionId`) |
 | `setAlwaysApprove` | `x.ai/always_approve` |
 | `setAutoTrustNewSessions` | `x.ai/auto_trust_new_sessions` |
 | `refreshPlanContent` | `x.ai/plan_content` |
